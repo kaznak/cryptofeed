@@ -1,14 +1,17 @@
+from collections import defaultdict
 import logging
 from decimal import Decimal
+from typing import Dict, Tuple
 
 from sortedcontainers import SortedDict as sd
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection
-from cryptofeed.defines import BID, ASK, BUY, DERIBIT, FUNDING, L2_BOOK, LIQUIDATIONS, OPEN_INTEREST, SELL, TICKER, TRADES
+from cryptofeed.defines import BID, ASK, BUY, DERIBIT, FUNDING, FUTURES, L2_BOOK, LIQUIDATIONS, OPEN_INTEREST, PERPETUAL, SELL, TICKER, TRADES, FILLED
 from cryptofeed.feed import Feed
 from cryptofeed.exceptions import MissingSequenceNumber
 from cryptofeed.standards import timestamp_normalize
+from cryptofeed.symbols import Symbol
 
 
 LOG = logging.getLogger('feedhandler')
@@ -16,20 +19,31 @@ LOG = logging.getLogger('feedhandler')
 
 class Deribit(Feed):
     id = DERIBIT
+    symbol_endpoint = ['https://www.deribit.com/api/v2/public/get_instruments?currency=BTC&expired=false', 'https://www.deribit.com/api/v2/public/get_instruments?currency=ETH&expired=false']
+
+    @classmethod
+    def _parse_symbol_data(cls, data: list) -> Tuple[Dict, Dict]:
+        ret = {}
+        info = defaultdict(dict)
+
+        for entry in data:
+            for e in entry['result']:
+                base = e['base_currency']
+                quote = e['quote_currency']
+                stype = e['kind'] if e['settlement_period'] != 'perpetual' else PERPETUAL
+                otype = e.get('option_type')
+                strike_price = e.get('strike')
+                strike_price = int(strike_price) if strike_price else None
+                expiry = e['expiration_timestamp'] / 1000
+                s = Symbol(base, quote, type=FUTURES if stype == 'future' else stype, option_type=otype, strike_price=strike_price, expiry_date=expiry)
+
+                ret[s.normalized] = e['instrument_name']
+                info['tick_size'][s.normalized] = e['tick_size']
+                info['instrument_type'][s.normalized] = stype
+        return ret, info
 
     def __init__(self, **kwargs):
         super().__init__('wss://www.deribit.com/ws/api/v2', **kwargs)
-
-        # TODO: the same verification (below) is done in Bitmex => share this code in a common function in super class Feed
-        instruments = self.get_instruments()
-        pairs = None
-        if self.subscription:
-            subscribing_instruments = list(self.subscription.values())
-            pairs = [pair for inner in subscribing_instruments for pair in inner]
-
-        for pair in set(self.symbols or pairs):
-            if pair not in instruments:
-                raise ValueError(f"{pair} is not active on {self.id}")
         self.__reset()
 
     def __reset(self):
@@ -65,7 +79,7 @@ class Deribit(Feed):
         for trade in msg["params"]["data"]:
             await self.callback(TRADES,
                                 feed=self.id,
-                                symbol=trade["instrument_name"],
+                                symbol=self.exchange_symbol_to_std_symbol(trade["instrument_name"]),
                                 order_id=trade['trade_id'],
                                 side=BUY if trade['direction'] == 'buy' else SELL,
                                 amount=Decimal(trade['amount']),
@@ -76,11 +90,12 @@ class Deribit(Feed):
             if 'liquidation' in trade:
                 await self.callback(LIQUIDATIONS,
                                     feed=self.id,
-                                    symbol=trade["instrument_name"],
+                                    symbol=self.exchange_symbol_to_std_symbol(trade["instrument_name"]),
                                     side=BUY if trade['direction'] == 'buy' else SELL,
                                     leaves_qty=Decimal(trade['amount']),
                                     price=Decimal(trade['price']),
                                     order_id=trade['trade_id'],
+                                    status=FILLED,
                                     timestamp=timestamp_normalize(self.id, trade['timestamp']),
                                     receipt_timestamp=timestamp
                                     )
@@ -117,7 +132,7 @@ class Deribit(Feed):
             "method" : "subscription",
             "jsonrpc" : "2.0"}
         '''
-        pair = msg['params']['data']['instrument_name']
+        pair = self.exchange_symbol_to_std_symbol(msg['params']['data']['instrument_name'])
         ts = timestamp_normalize(self.id, msg['params']['data']['timestamp'])
         await self.callback(TICKER, feed=self.id,
                             symbol=pair,
@@ -149,10 +164,10 @@ class Deribit(Feed):
         self.__reset()
         client_id = 0
         channels = []
-        for chan in set(self.channels or self.subscription):
-            for pair in set(self.symbols or self.subscription[chan]):
+        for chan in self.subscription:
+            for pair in self.subscription[chan]:
                 channels.append(f"{chan}.{pair}.raw")
-        await conn.send(json.dumps(
+        await conn.write(json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": client_id,
@@ -181,7 +196,7 @@ class Deribit(Feed):
         }
         """
         ts = msg["params"]["data"]["timestamp"]
-        pair = msg["params"]["data"]["instrument_name"]
+        pair = self.exchange_symbol_to_std_symbol(msg["params"]["data"]["instrument_name"])
         self.l2_book[pair] = {
             BID: sd({
                 Decimal(price): Decimal(amount)
@@ -200,7 +215,7 @@ class Deribit(Feed):
 
     async def _book_update(self, msg: dict, timestamp: float):
         ts = msg["params"]["data"]["timestamp"]
-        pair = msg["params"]["data"]["instrument_name"]
+        pair = self.exchange_symbol_to_std_symbol(msg["params"]["data"]["instrument_name"])
 
         if msg['params']['data']['prev_change_id'] != self.seq_no[pair]:
             LOG.warning("%s: Missing sequence number detected for %s", self.id, pair)

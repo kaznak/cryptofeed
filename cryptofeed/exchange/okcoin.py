@@ -5,24 +5,25 @@ Please see the LICENSE file for the terms and conditions
 associated with this software.
 '''
 import asyncio
+from collections import defaultdict
+from cryptofeed.symbols import Symbol
 
 from decimal import Decimal
 from itertools import islice
 from functools import partial
 import logging
 import zlib
-from typing import List, Tuple, Callable
+from typing import Dict, List, Tuple, Callable
 
 from sortedcontainers import SortedDict as sd
 from yapic import json
 
 from cryptofeed.auth.okcoin import generate_token
-from cryptofeed.connection import AsyncConnection
-from cryptofeed.defines import ASK, BID, BUY, FUNDING, L2_BOOK, OKCOIN, OPEN_INTEREST, SELL, TICKER, TRADES, LIQUIDATIONS, ORDER_INFO
+from cryptofeed.connection import AsyncConnection, WSAsyncConn
+from cryptofeed.defines import ASK, BID, BUY, FUNDING, L2_BOOK, OKCOIN, OPEN_INTEREST, SELL, SPOT, TICKER, TRADES, LIQUIDATIONS, ORDER_INFO
 from cryptofeed.exceptions import BadChecksum
 from cryptofeed.feed import Feed
-from cryptofeed.standards import symbol_exchange_to_std, timestamp_normalize, is_authenticated_channel
-from cryptofeed.symbols import get_symbol_separator
+from cryptofeed.standards import timestamp_normalize, is_authenticated_channel
 from cryptofeed.util import split
 
 
@@ -31,9 +32,31 @@ LOG = logging.getLogger('feedhandler')
 
 class OKCoin(Feed):
     id = OKCOIN
+    symbol_endpoint = 'https://www.okcoin.com/api/spot/v3/instruments'
+
+    @classmethod
+    def _parse_symbol_data(cls, data: dict) -> Tuple[Dict, Dict]:
+        ret = {}
+        info = defaultdict(dict)
+        for e in data:
+
+            s = Symbol(e['base_currency'], e['quote_currency'])
+            ret[s.normalized] = e['instrument_id']
+            info['tick_size'][s.normalized] = e['tick_size']
+            info['instrument_type'][s.normalized] = s.type
+        return ret, info
 
     def __init__(self, **kwargs):
         super().__init__('wss://real.okcoin.com:8443/ws/v3', **kwargs)
+
+        for chan in self.subscription:
+            if chan != LIQUIDATIONS:
+                continue
+            for symbol in self.subscription[chan]:
+                instrument_type = self.instrument_type(symbol)
+                if instrument_type == SPOT:
+                    raise ValueError("LIQUIDATIONS only supports futures and swap trading pairs")
+
         self.open_interest = {}
 
     def __reset(self):
@@ -75,25 +98,18 @@ class OKCoin(Feed):
         for chunk in split.list_by_max_items(symbol_channels, 33):
             LOG.info("%s: Subscribe to %s args from %r to %r", self.id, len(chunk), chunk[0], chunk[-1])
             request = {"op": "subscribe", "args": chunk}
-            await conn.send(json.dumps(request))
+            await conn.write(json.dumps(request))
 
-    @staticmethod
-    def instrument_type(pair):
-        dash_count = pair.count(get_symbol_separator())
-        if dash_count == 1:  # BTC-USDT
-            return 'spot'
-        if dash_count == 4:  # BTC-USD-201225-35000-P
-            return 'option'
-        if pair[-4:] == "SWAP":  # BTC-USDT-SWAP
-            return 'swap'
-        return 'futures'  # BTC-USDT-201225
+    @classmethod
+    def instrument_type(cls, symbol: str):
+        return cls.info()['instrument_type'][symbol]
 
     def get_channel_symbol_combinations(self):
-        for chan in set(self.channels or self.subscription):
+        for chan in self.subscription:
             if not is_authenticated_channel(chan):
                 if chan == LIQUIDATIONS:
                     continue
-                for symbol in set(self.symbols or self.subscription[chan]):
+                for symbol in self.subscription[chan]:
                     instrument_type = self.instrument_type(symbol)
                     if instrument_type != 'swap' and 'funding' in chan:
                         continue  # No funding for spot, futures and options
@@ -108,8 +124,8 @@ class OKCoin(Feed):
             update_timestamp = timestamp_normalize(self.id, update['timestamp'])
             await self.callback(TICKER, feed=self.id,
                                 symbol=pair,
-                                bid=Decimal(update['best_bid']),
-                                ask=Decimal(update['best_ask']),
+                                bid=Decimal(update['best_bid']) if update['best_bid'] else Decimal(0),
+                                ask=Decimal(update['best_ask']) if update['best_ask'] else Decimal(0),
                                 timestamp=update_timestamp,
                                 receipt_timestamp=timestamp)
             if 'open_interest' in update:
@@ -124,13 +140,13 @@ class OKCoin(Feed):
         {'table': 'spot/trade', 'data': [{'instrument_id': 'BTC-USD', 'price': '3977.44', 'side': 'buy', 'size': '0.0096', 'timestamp': '2019-03-22T22:45:44.578Z', 'trade_id': '486519521'}]}
         """
         for trade in msg['data']:
-            if msg['table'] == 'futures/trade':
+            if msg['table'] in {'futures/trade', 'option/trade'}:
                 amount_sym = 'qty'
             else:
                 amount_sym = 'size'
             await self.callback(TRADES,
                                 feed=self.id,
-                                symbol=symbol_exchange_to_std(trade['instrument_id']),
+                                symbol=self.exchange_symbol_to_std_symbol(trade['instrument_id']),
                                 order_id=trade['trade_id'],
                                 side=BUY if trade['side'] == 'buy' else SELL,
                                 amount=Decimal(trade[amount_sym]),
@@ -143,7 +159,7 @@ class OKCoin(Feed):
         for update in msg['data']:
             await self.callback(FUNDING,
                                 feed=self.id,
-                                symbol=symbol_exchange_to_std(update['instrument_id']),
+                                symbol=self.exchange_symbol_to_std_symbol(update['instrument_id']),
                                 timestamp=timestamp_normalize(self.id, update['funding_time']),
                                 receipt_timestamp=timestamp,
                                 rate=update['funding_rate'],
@@ -154,7 +170,7 @@ class OKCoin(Feed):
         if msg['action'] == 'partial':
             # snapshot
             for update in msg['data']:
-                pair = symbol_exchange_to_std(update['instrument_id'])
+                pair = self.exchange_symbol_to_std_symbol(update['instrument_id'])
                 self.l2_book[pair] = {
                     BID: sd({
                         Decimal(price): Decimal(amount) for price, amount, *_ in update['bids']
@@ -171,7 +187,7 @@ class OKCoin(Feed):
             # update
             for update in msg['data']:
                 delta = {BID: [], ASK: []}
-                pair = symbol_exchange_to_std(update['instrument_id'])
+                pair = self.exchange_symbol_to_std_symbol(update['instrument_id'])
                 for side in ('bids', 'asks'):
                     s = BID if side == 'bids' else ASK
                     for price, amount, *_ in update[side]:
@@ -198,7 +214,7 @@ class OKCoin(Feed):
         data = {k: Decimal(msg['data'][0][k]) for k in keys if k in msg['data'][0]}
 
         await self.callback(ORDER_INFO, feed=self.id,
-                            symbol=symbol_exchange_to_std(msg['data'][0]['instrument_id'].upper()),  # This uses the REST endpoint format (lower case)
+                            symbol=self.exchange_symbol_to_std_symbol(msg['data'][0]['instrument_id'].upper()),  # This uses the REST endpoint format (lower case)
                             status=status,
                             order_id=msg['data'][0]['order_id'],
                             side=BUY if msg['data'][0]['side'].lower() == 'buy' else SELL,
@@ -244,13 +260,12 @@ class OKCoin(Feed):
 
     def connect(self) -> List[Tuple[AsyncConnection, Callable[[None], None], Callable[[str, float], None]]]:
         ret = []
-        for channel in self.subscription or self.channels:
+        for channel in self.subscription:
             if is_authenticated_channel(channel):
-                syms = self.symbols or self.subscription[channel]
-                for s in syms:
-                    ret.append((AsyncConnection(self.address, self.id, **self.ws_defaults), partial(self.user_order_subscribe, symbol=s), self.message_handler))
+                for s in self.subscription[channel]:
+                    ret.append((WSAsyncConn(self.address, self.id, **self.ws_defaults), partial(self.user_order_subscribe, symbol=s), self.message_handler, self.authenticate))
             else:
-                ret.append((AsyncConnection(self.address, self.id, **self.ws_defaults), self.subscribe, self.message_handler))
+                ret.append((WSAsyncConn(self.address, self.id, **self.ws_defaults), self.subscribe, self.message_handler, self.authenticate))
 
         return ret
 
@@ -259,8 +274,8 @@ class OKCoin(Feed):
         timestamp, sign = generate_token(self.key_id, self.key_secret)
         login_param = {"op": "login", "args": [self.key_id, self.config.okex.key_passphrase, timestamp, sign.decode("utf-8")]}
         login_str = json.dumps(login_param)
-        await conn.send(login_str)
+        await conn.write(login_str)
         await asyncio.sleep(5)
         sub_param = {"op": "subscribe", "args": ["spot/order:{}".format(symbol)]}
         sub_str = json.dumps(sub_param)
-        await conn.send(sub_str)
+        await conn.write(sub_str)

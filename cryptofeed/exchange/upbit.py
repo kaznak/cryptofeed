@@ -1,5 +1,6 @@
 import logging
 from decimal import Decimal
+from typing import Dict, Tuple
 import uuid
 
 from sortedcontainers import SortedDict as sd
@@ -8,7 +9,8 @@ from yapic import json
 from cryptofeed.connection import AsyncConnection
 from cryptofeed.defines import BID, ASK, BUY, L2_BOOK, SELL, TICKER, TRADES, UPBIT
 from cryptofeed.feed import Feed
-from cryptofeed.standards import symbol_exchange_to_std, timestamp_normalize
+from cryptofeed.standards import timestamp_normalize
+from cryptofeed.symbols import Symbol
 
 
 LOG = logging.getLogger('feedhandler')
@@ -17,6 +19,18 @@ LOG = logging.getLogger('feedhandler')
 class Upbit(Feed):
     id = UPBIT
     api = 'https://api.upbit.com/v1/'
+    symbol_endpoint = 'https://api.upbit.com/v1/market/all'
+
+    @classmethod
+    def _parse_symbol_data(cls, data: dict) -> Tuple[Dict, Dict]:
+        ret = {}
+        info = {'instrument_type': {}}
+        for entry in data:
+            quote, base = entry['market'].split("-")
+            s = Symbol(base, quote)
+            ret[s.normalized] = entry['market']
+            info['instrument_type'][s.normalized] = s.type
+        return ret, info
 
     def __init__(self, **kwargs):
         super().__init__('wss://api.upbit.com/websocket/v1', **kwargs)
@@ -47,7 +61,7 @@ class Upbit(Feed):
         amount = Decimal(msg['tv'])
         await self.callback(TRADES, feed=self.id,
                             order_id=msg['sid'],
-                            symbol=symbol_exchange_to_std(msg['cd']),
+                            symbol=self.exchange_symbol_to_std_symbol(msg['cd']),
                             side=BUY if msg['ab'] == 'BID' else SELL,
                             amount=amount,
                             price=price,
@@ -84,7 +98,7 @@ class Upbit(Feed):
             'tms': 1584263923870,  // Timestamp
         }
         """
-        pair = symbol_exchange_to_std(msg['cd'])
+        pair = self.exchange_symbol_to_std_symbol(msg['cd'])
         orderbook_timestamp = timestamp_normalize(self.id, msg['tms'])
         forced = pair not in self.l2_book
 
@@ -193,8 +207,8 @@ class Upbit(Feed):
         """
 
         chans = [{"ticket": uuid.uuid4()}, {"format": "SIMPLE"}]
-        for chan in set(self.channels or self.subscription):
-            codes = list(set(self.symbols or self.subscription[chan]))
+        for chan in self.subscription:
+            codes = list(self.subscription[chan])
             if chan == L2_BOOK:
                 chans.append({"type": "orderbook", "codes": codes, 'isOnlyRealtime': True})
             if chan == TRADES:
@@ -202,4 +216,4 @@ class Upbit(Feed):
             if chan == TICKER:
                 chans.append({"type": "ticker", "codes": codes, 'isOnlyRealtime': True})
 
-        await conn.send(json.dumps(chans))
+        await conn.write(json.dumps(chans))

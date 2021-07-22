@@ -1,31 +1,13 @@
 '''
-Huobi_DM has 3 futures per currency (with USD as base): weekly, bi-weekly(the next week), quarterly and next quarter.
+Copyright (C) 2017-2021  Bryant Moscon - bmoscon@gmail.com
 
-You must subscribe to them with: CRY_TC
-where
-   CRY = BTC, ETC, etc.
-   TC is the time code mapping below:
-     mapping  = {
-         "this_week": "CW",   # current week
-         "next_week": "NW",   # next week
-         "quarter": "CQ",     # current quarter
-         "next_quarter": "NQ" # Next quarter
-
-     }
-
-So for example, to get the quarterly BTC future, you subscribe to "BTC_CQ", and it is returned to channel "market.BTC_CQ. ..."
-However since the actual contract changes over time, we want to publish the pair name using the actual expiry date, which
-is contained in the exchanges "contract_code".
-
-Here's what you get for BTC querying https://www.hbdm.com/api/v1/contract_contract_info on 2019 Aug 16:
-[{"symbol":"BTC","contract_code":"BTC190816","contract_type":"this_week","contract_size":100.000000000000000000,"price_tick":0.010000000000000000,"delivery_date":"20190816","create_date":"20190802","contract_status":1}
-,{"symbol":"BTC","contract_code":"BTC190823","contract_type":"next_week","contract_size":100.000000000000000000,"price_tick":0.010000000000000000,"delivery_date":"20190823","create_date":"20190809","contract_status":1}
-,{"symbol":"BTC","contract_code":"BTC190927","contract_type":"quarter","contract_size":100.000000000000000000,"price_tick":0.010000000000000000,"delivery_date":"20190927","create_date":"20190614","contract_status":1},
-...]
-So we return BTC190927 as the pair name for the BTC quarterly future.
-
+Please see the LICENSE file for the terms and conditions
+associated with this software.
 '''
+from collections import defaultdict
+from cryptofeed.symbols import Symbol
 import logging
+from typing import Dict, Tuple
 import zlib
 from decimal import Decimal
 
@@ -33,9 +15,9 @@ from sortedcontainers import SortedDict as sd
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection
-from cryptofeed.defines import BID, ASK, BUY, HUOBI_DM, L2_BOOK, SELL, TRADES
+from cryptofeed.defines import BID, ASK, BUY, FUNDING, FUTURES, HUOBI_DM, L2_BOOK, SELL, TRADES
 from cryptofeed.feed import Feed
-from cryptofeed.standards import symbol_exchange_to_std, symbol_std_to_exchange, timestamp_normalize
+from cryptofeed.standards import timestamp_normalize
 
 
 LOG = logging.getLogger('feedhandler')
@@ -43,6 +25,21 @@ LOG = logging.getLogger('feedhandler')
 
 class HuobiDM(Feed):
     id = HUOBI_DM
+    symbol_endpoint = 'https://www.hbdm.com/api/v1/contract_contract_info'
+
+    @classmethod
+    def _parse_symbol_data(cls, data: dict) -> Tuple[Dict, Dict]:
+        ret = {}
+        info = defaultdict(dict)
+
+        for e in data['data']:
+            # Pricing is all in USD, see https://huobiglobal.zendesk.com/hc/en-us/articles/360000113102-Introduction-of-Huobi-Futures
+            s = Symbol(e['symbol'], 'USD', type=FUTURES, expiry_date=e['contract_code'].replace(e['symbol'], ''))
+
+            ret[s.normalized] = e['contract_code']
+            info['tick_size'][s.normalized] = e['price_tick']
+            info['instrument_type'][s.normalized] = FUTURES
+        return ret, info
 
     def __init__(self, **kwargs):
         super().__init__('wss://www.hbdm.com/ws', **kwargs)
@@ -70,7 +67,7 @@ class HuobiDM(Feed):
             'ch':'market.BTC_CW.depth.step0'
         }
         """
-        pair = symbol_std_to_exchange(msg['ch'].split('.')[1], self.id)
+        pair = self.exchange_symbol_to_std_symbol(msg['ch'].split('.')[1])
         data = msg['tick']
         forced = pair not in self.l2_book
 
@@ -109,7 +106,7 @@ class HuobiDM(Feed):
         for trade in msg['tick']['data']:
             await self.callback(TRADES,
                                 feed=self.id,
-                                symbol=symbol_std_to_exchange(msg['ch'].split('.')[1], self.id),
+                                symbol=self.exchange_symbol_to_std_symbol(msg['ch'].split('.')[1]),
                                 order_id=trade['id'],
                                 side=BUY if trade['direction'] == 'buy' else SELL,
                                 amount=Decimal(trade['amount']),
@@ -126,7 +123,7 @@ class HuobiDM(Feed):
 
         # Huobi sends a ping evert 5 seconds and will disconnect us if we do not respond to it
         if 'ping' in msg:
-            await conn.send(json.dumps({'pong': msg['ping']}))
+            await conn.write(json.dumps({'pong': msg['ping']}))
         elif 'status' in msg and msg['status'] == 'ok':
             return
         elif 'ch' in msg:
@@ -142,11 +139,12 @@ class HuobiDM(Feed):
     async def subscribe(self, conn: AsyncConnection):
         self.__reset()
         client_id = 0
-        for chan in set(self.channels or self.subscription):
-            for pair in set(self.symbols or self.subscription[chan]):
+        for chan in self.subscription:
+            if chan == FUNDING:
+                continue
+            for pair in self.subscription[chan]:
                 client_id += 1
-                pair = symbol_exchange_to_std(pair)
-                await conn.send(json.dumps(
+                await conn.write(json.dumps(
                     {
                         "sub": f"market.{pair}.{chan}",
                         "id": str(client_id)

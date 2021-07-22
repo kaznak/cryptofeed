@@ -61,13 +61,9 @@ class BackendBookDeltaCallback:
 
 
 class BackendTradeCallback:
-    async def __call__(self, *, feed: str, symbol: str, side: str, amount: Decimal, price: Decimal, order_id=None, timestamp: float, receipt_timestamp: float, order_type: str = None):
+    async def __call__(self, *, feed: str, symbol: str, side: str, amount: Decimal, price: Decimal, order_id: str = None, timestamp: float, receipt_timestamp: float, order_type: str = None):
         data = {'feed': feed, 'symbol': symbol, 'timestamp': timestamp, 'receipt_timestamp': receipt_timestamp,
-                'side': side, 'amount': self.numeric_type(amount), 'price': self.numeric_type(price)}
-        if order_id:
-            data['id'] = order_id
-        if order_type:
-            data['order_type'] = order_type
+                'side': side, 'amount': self.numeric_type(amount), 'price': self.numeric_type(price), 'order_type': order_type, 'id': order_id}
         await self.write(feed, symbol, timestamp, receipt_timestamp, data)
 
 
@@ -103,25 +99,9 @@ class BackendFuturesIndexCallback:
 
 
 class BackendLiquidationsCallback:
-    async def __call__(self, *, feed: str, symbol: str, side: str, leaves_qty: Decimal, price: Decimal, order_id: str, timestamp: float, receipt_timestamp: float):
-        data = {'feed': feed, 'symbol': symbol, 'side': side, 'leaves_qty': self.numeric_type(leaves_qty), 'price': self.numeric_type(price), 'order_id': order_id if order_id else "None", 'receipt_timestamp': receipt_timestamp, 'timestamp': timestamp}
+    async def __call__(self, *, feed: str, symbol: str, side: str, leaves_qty: Decimal, price: Decimal, order_id: str, status: str, timestamp: float, receipt_timestamp: float):
+        data = {'feed': feed, 'symbol': symbol, 'side': side, 'leaves_qty': self.numeric_type(leaves_qty), 'price': self.numeric_type(price), 'order_id': order_id if order_id else "None", 'status': status, 'receipt_timestamp': receipt_timestamp, 'timestamp': timestamp}
         await self.write(feed, symbol, timestamp, receipt_timestamp, data)
-
-
-class BackendMarketInfoCallback:
-    async def __call__(self, *, feed: str, symbol: str, timestamp: float, **kwargs):
-        kwargs['feed'] = feed
-        kwargs['symbol'] = symbol
-        kwargs['timestamp'] = timestamp
-        await self.write(feed, symbol, timestamp, timestamp, kwargs)
-
-
-class BackendTransactionsCallback:
-    async def __call__(self, *, feed: str, symbol: str, timestamp: float, **kwargs):
-        kwargs['feed'] = feed
-        kwargs['symbol'] = symbol
-        kwargs['timestamp'] = timestamp
-        await self.write(feed, symbol, timestamp, timestamp, kwargs)
 
 
 class BackendCandlesCallback:
